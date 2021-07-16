@@ -7,8 +7,9 @@ namespace Obsidian.API
     public interface IPlayer : ILiving
     {
         public string Username { get; }
+        public string DisplayName { get; }
+
         public Guid Uuid { get; }
-        public IServer Server { get; }
         public bool IsOperator { get; }
 
         public Gamemode Gamemode { get; set; }
@@ -16,9 +17,6 @@ namespace Obsidian.API
         public PlayerBitMask PlayerBitMask { get; set; }
 
         public bool Sleeping { get; set; }
-        public bool Sneaking { get; set; }
-        public bool Sprinting { get; set; }
-        public bool FlyingWithElytra { get; set; }
         public bool InHorseInventory { get; set; }
 
         public short AttackTime { get; set; }
@@ -50,7 +48,6 @@ namespace Obsidian.API
         public Task KickAsync(IChatMessage reason);
         public Task KickAsync(string reason);
         public Task OpenInventoryAsync(Inventory inventory);
-
         public Task DisplayScoreboardAsync(IScoreboard scoreboard, ScoreboardPosition position);
 
         public Task<bool> GrantPermission(string permission);
@@ -59,5 +56,7 @@ namespace Obsidian.API
         public Task<bool> HasAnyPermission(IEnumerable<string> permissions);
         public Task<bool> HasAllPermissions(IEnumerable<string> permissions);
         public Task SetGamemodeAsync(Gamemode gamemode);
+
+        public Task UpdateDisplayNameAsync(string newDisplayName);
     }
 }

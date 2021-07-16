@@ -1,11 +1,13 @@
-﻿using Obsidian.ChunkData;
+﻿using Obsidian.API;
+using Obsidian.ChunkData;
 using Obsidian.Entities;
 using Obsidian.Nbt;
-using Obsidian.Nbt.Tags;
 using Obsidian.Utilities;
 using Obsidian.Utilities.Collection;
 using System;
+using System.Collections;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -15,7 +17,7 @@ namespace Obsidian.WorldData
 {
     public class Region
     {
-        public const int cubicRegionSizeShift = 3;
+        public const int cubicRegionSizeShift = 5;
         public const int cubicRegionSize = 1 << cubicRegionSizeShift;
 
         private bool cancel = false;
@@ -26,9 +28,11 @@ namespace Obsidian.WorldData
 
         public string RegionFolder { get; }
 
-        public ConcurrentDictionary<int, Entity> Entities { get; private set; } = new ConcurrentDictionary<int, Entity>();
+        public ConcurrentDictionary<int, Entity> Entities { get; private set; } = new();
 
-        public DenseCollection<Chunk> LoadedChunks { get; private set; } = new DenseCollection<Chunk>(cubicRegionSize, cubicRegionSize);
+        private DenseCollection<Chunk> LoadedChunks { get; set; } = new DenseCollection<Chunk>(cubicRegionSize, cubicRegionSize);
+
+        private readonly RegionFile regionFile;
 
         internal Region(int x, int z, string worldRegionsPath)
         {
@@ -36,118 +40,124 @@ namespace Obsidian.WorldData
             this.Z = z;
             RegionFolder = Path.Join(worldRegionsPath, "regions");
             Directory.CreateDirectory(RegionFolder);
-            var regionFile = Path.Join(RegionFolder, $"{X}.{Z}.rgn");
-            if (File.Exists(regionFile))
+            var filePath = Path.Join(RegionFolder, $"{X}.{Z}.mcr");
+            regionFile = new RegionFile(filePath, cubicRegionSize);
+
+        }
+
+        internal async Task InitAsync()
+        {
+            await regionFile.InitializeAsync();
+        }
+
+        internal async Task FlushAsync()
+        {
+            foreach(Chunk c in LoadedChunks) { SerializeChunk(c); }
+            await regionFile.FlushToDiskAsync();
+        }
+
+        internal Chunk GetChunk((int X, int Z) relativePos) =>  GetChunk(relativePos.X, relativePos.Z);
+
+        internal Chunk GetChunk(int relativeX, int relativeZ) => GetChunk(new Vector(relativeX, 0, relativeZ));
+
+        internal Chunk GetChunk(Vector relativePosition)
+        {
+            var chunk = LoadedChunks[relativePosition.X, relativePosition.Z];
+            if (chunk is null)
             {
-                Load(regionFile);
-                IsDirty = false;
+                chunk = GetChunkFromFile(relativePosition); // Still might be null but that's okay.
+                LoadedChunks[relativePosition.X, relativePosition.Z] = chunk;
             }
+            return chunk;
+        }
+
+        private Chunk GetChunkFromFile(Vector relativePosition)
+        {
+            var compressedBytes = regionFile.GetChunkCompressedBytes(relativePosition);
+            if (compressedBytes is null) { return null; }
+            using Stream strm = new MemoryStream(compressedBytes);
+            NbtReader reader = new(strm, NbtCompression.GZip);
+            NbtCompound chunkNbt = reader.ReadNextTag() as NbtCompound;
+            return GetChunkFromNbt(chunkNbt);
+        }
+
+        internal IEnumerable<Chunk> GeneratedChunks()
+        {
+            foreach(var c in LoadedChunks)
+            {
+                if (c is not null && c.isGenerated)
+                {
+                    yield return c;
+                }
+            }
+        }
+
+        internal void SetChunk(Chunk chunk)
+        {
+            if (chunk is null) { return; } // I dunno... maybe we'll need to null out a chunk someday?
+            var relativePosition = new Vector(NumericsHelper.Modulo(chunk.X, cubicRegionSize), 0, NumericsHelper.Modulo(chunk.Z, cubicRegionSize));
+            LoadedChunks[relativePosition.X, relativePosition.Z] = chunk;
+        }
+
+        internal void SerializeChunk(Chunk chunk)
+        {
+            var relativePosition = new Vector(NumericsHelper.Modulo(chunk.X, cubicRegionSize), 0, NumericsHelper.Modulo(chunk.Z, cubicRegionSize));
+            NbtCompound chunkNbt = GetNbtFromChunk(chunk);
+            using MemoryStream strm = new();
+            using NbtWriter writer = new(strm, NbtCompression.GZip);
+            writer.WriteTag(chunkNbt);
+            writer.TryFinish();
+            regionFile.SetChunkCompressedBytes(relativePosition, strm.ToArray());
         }
 
         internal async Task BeginTickAsync(CancellationToken cts)
         {
-            double flushTime = 0;
             while (!cts.IsCancellationRequested || cancel)
             {
                 await Task.Delay(20, cts);
 
                 await Task.WhenAll(Entities.Select(entityEntry => entityEntry.Value.TickAsync()));
-
-                flushTime++;
-
-                if (flushTime > 50 * 30) // Save every 30 seconds
-                {
-                    Flush();
-                    flushTime = 0;
-                }
             }
-            Flush();
+            await regionFile.FlushToDiskAsync();
         }
 
         internal void Cancel() => this.cancel = true;
 
-        public void Flush()
-        {
-            if (!IsDirty) { return; }
-            var regionPath = Path.Join(RegionFolder, $"{X}.{Z}.rgn");
-            if (File.Exists(regionPath))
-                File.Copy(regionPath, regionPath + ".bak");
-            
-            var regionCompound = GetNbt();
-            var regionFile = new NbtFile();
-            regionFile.RootTag = regionCompound;
-            regionFile.SaveToFile(regionPath, NbtCompression.GZip);
-            
-            File.Delete(regionPath + ".bak");
-            regionCompound = null;
-            regionFile = null;
-            GC.Collect();
-            IsDirty = false;
-        }
-
-        public void Load(string regionFile)
-        {
-            var regionNbt = new NbtFile();
-            try
-            {
-                regionNbt.LoadFromFile(regionFile);
-            }
-            catch (Exception)
-            {
-                File.Delete(regionFile);
-                File.Move(regionFile + ".bak", regionFile);
-                regionNbt.LoadFromFile(regionFile);
-            }
-            finally
-            {
-                File.Delete(regionFile + ".bak");
-            }
-
-            NbtCompound regionCompound = regionNbt.RootTag;
-            var chunksNbt = regionCompound["Chunks"] as NbtList;
-            foreach (var chunkNbt in chunksNbt)
-            {
-                var chunk = GetChunkFromNbt((NbtCompound) chunkNbt);
-                var index = (NumericsHelper.Modulo(chunk.X, cubicRegionSize), NumericsHelper.Modulo(chunk.Z, cubicRegionSize));
-                LoadedChunks[index.Item1, index.Item2] = chunk;
-            }
-            regionNbt = null;
-            regionCompound = null;
-            GC.Collect();
-            IsDirty = false;
-        }
-
-        #region File saving/loading
+        #region NBT Ops
         public static Chunk GetChunkFromNbt(NbtCompound chunkCompound)
         {
-            int x = chunkCompound["xPos"].IntValue;
-            int z = chunkCompound["zPos"].IntValue;
+            int x = chunkCompound.GetInt("xPos");
+            int z = chunkCompound.GetInt("zPos");
 
-            var chunk = new Chunk(x, z);
+            var chunk = new Chunk(x, z)
+            {
+                isGenerated = true
+            };
 
             foreach (var secCompound in chunkCompound["Sections"] as NbtList)
             {
-                var secY = (int)secCompound["Y"].ByteValue;
-                var states = (secCompound["BlockStates"] as NbtLongArray).Value;
-                var palettes = secCompound["Palette"] as NbtList;
+                var compound = secCompound as NbtCompound;
+                var secY = (int)compound.GetByte("Y");
+                var states = compound["BlockStates"] as NbtArray<long>;//TODO
+                var palettes = compound["Palette"] as NbtList;
 
-                chunk.Sections[secY].BlockStorage.Storage = states;
+                chunk.Sections[secY].BlockStorage.Storage = states.GetArray();
 
                 var chunkSecPalette = (LinearBlockStatePalette)chunk.Sections[secY].Palette;
-                foreach (var palette in palettes)
+                foreach (NbtCompound palette in palettes)
                 {
-                    var block = new Block(palette["Id"].IntValue);
+
+                    var block = new Block(palette.GetInt("Id"));
                     chunkSecPalette.GetIdFromState(block);
                 }
             }
 
-            chunk.BiomeContainer.Biomes = (chunkCompound["Biomes"] as NbtIntArray).Value.ToList();
+            chunk.BiomeContainer.Biomes = (chunkCompound["Biomes"] as NbtArray<int>).GetArray().ToList();
 
-            foreach (var heightmap in chunkCompound["Heightmaps"] as NbtCompound)
+            foreach (var (name, heightmap) in chunkCompound["Heightmaps"] as NbtCompound)
             {
-                var heightmapType = (HeightmapType)Enum.Parse(typeof(HeightmapType), heightmap.Name.Replace("_", ""), true);
-                var values = ((NbtLongArray)heightmap).Value;
-                chunk.Heightmaps[heightmapType].data.Storage = values;
+                var heightmapType = (HeightmapType)Enum.Parse(typeof(HeightmapType), name.Replace("_", ""), true);
+                chunk.Heightmaps[heightmapType].data.Storage = ((NbtArray<long>)heightmap).GetArray();
             }
 
             return chunk;
@@ -155,9 +165,9 @@ namespace Obsidian.WorldData
 
         public NbtCompound GetNbt()
         {
-            var entitiesCompound = new NbtList("Entities"); //TODO: this
+            // var entitiesCompound = new NbtList("Entities"); //TODO: this
 
-            var chunksCompound = new NbtList("Chunks", NbtTagType.Compound);
+            var chunksCompound = new NbtList(NbtTagType.Compound, "Chunks");
             foreach (var chunk in LoadedChunks)
             {
                 var chunkNbt = GetNbtFromChunk(chunk);
@@ -166,8 +176,8 @@ namespace Obsidian.WorldData
 
             var regionCompound = new NbtCompound("Data")
             {
-                new NbtInt("xPos", this.X),
-                new NbtInt("zPos", this.Z),
+                new NbtTag<int>("xPos", this.X),
+                new NbtTag<int>("zPos", this.Z),
                 chunksCompound
             };
 
@@ -176,52 +186,54 @@ namespace Obsidian.WorldData
 
         public static NbtCompound GetNbtFromChunk(Chunk chunk)
         {
-            var sectionsCompound = new NbtList("Sections", NbtTagType.Compound);
+            var sectionsCompound = new NbtList(NbtTagType.Compound, "Sections");
             foreach (var section in chunk.Sections)
             {
                 if (section.YBase is null) { throw new InvalidOperationException("Section Ybase should not be null"); }//THIS should never happen
 
-                var palette = new NbtList("Palette", NbtTagType.Compound);
+                var palette = new NbtList(NbtTagType.Compound, "Palette");
 
                 if (section.Palette is LinearBlockStatePalette linear)
                 {
-                    foreach (var block in linear.BlockStateArray)
+                    foreach (var stateId in linear.BlockStateArray)
                     {
-                        if (block.Id == 0)
+                        if (stateId == 0)
                             continue;
+
+                        var block = new Block(stateId);
 
                         palette.Add(new NbtCompound//TODO redstone etc... has a lit metadata added when creating the palette
                             {
-                                new NbtString("Name", block.UnlocalizedName),
-                                new NbtInt("Id", block.StateId)
+                                new NbtTag<string>("Name", block.UnlocalizedName),
+                                new NbtTag<int>("Id", block.StateId)
                             });
                     }
                 }
 
                 var sec = new NbtCompound()
                     {
-                        new NbtByte("Y", (byte)section.YBase),
+                        new NbtTag<byte>("Y", (byte)section.YBase),
                         palette,
-                        new NbtLongArray("BlockStates", section.BlockStorage.Storage)
+                        new NbtArray<long>("BlockStates", section.BlockStorage.Storage)
                     };
                 sectionsCompound.Add(sec);
             }
 
             var chunkCompound = new NbtCompound()
                 {
-                    new NbtInt("xPos", chunk.X),
-                    new NbtInt("zPos", chunk.Z),
-                    new NbtIntArray("Biomes", chunk.BiomeContainer.Biomes.ToArray()),
+                    new NbtTag<int>("xPos", chunk.X),
+                    new NbtTag<int>("zPos", chunk.Z),
+                    new NbtArray<int>("Biomes", chunk.BiomeContainer.Biomes),
                     new NbtCompound("Heightmaps")
                     {
-                        new NbtLongArray("MOTION_BLOCKING", chunk.Heightmaps[HeightmapType.MotionBlocking].data.Storage),
-                        new NbtLongArray("OCEAN_FLOOR", chunk.Heightmaps[HeightmapType.OceanFloor].data.Storage),
-                        new NbtLongArray("WORLD_SURFACE", chunk.Heightmaps[HeightmapType.WorldSurface].data.Storage),
+                        new NbtArray<long>("MOTION_BLOCKING", chunk.Heightmaps[HeightmapType.MotionBlocking].data.Storage),
+                        new NbtArray<long>("OCEAN_FLOOR", chunk.Heightmaps[HeightmapType.OceanFloor].data.Storage),
+                        new NbtArray<long>("WORLD_SURFACE", chunk.Heightmaps[HeightmapType.WorldSurface].data.Storage),
                     },
                     sectionsCompound
                 };
             return chunkCompound;
         }
-        #endregion File saving/loading
+        #endregion NBT Ops
     }
 }
